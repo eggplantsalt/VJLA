@@ -71,7 +71,7 @@ class GenerateConfig:
     # image_size: list[int] = [224, 224]
     future_action_window_size: int = 7
     action_dim: int = 7
-    use_bf16: bool = True
+    use_bf16: bool = False
     action_ensemble = True
     adaptive_ensemble_alpha = 0.1
     retriever_path: str = None
@@ -79,7 +79,7 @@ class GenerateConfig:
     load_in_4bit: bool = False                       # (For OpenVLA only) Load with 4-bit quantization
 
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
-
+    prompt_mode: str = "image_text_primary"
     #################################################################################################################
     # LIBERO environment-specific parameters
     #################################################################################################################

@@ -164,9 +164,17 @@ class InstructVLAServer:
             past_action_window_size=cfg.horizon,
             action_dim=cfg.action_dim,
         )
+        # if self.cfg.use_bf16:
+        #     # 仅把语言视觉主干切到 bf16，兼顾显存与吞吐。
+        #     self.vla.vlm = self.vla.vlm.to(torch.bfloat16)
         if self.cfg.use_bf16:
-            # 仅把语言视觉主干切到 bf16，兼顾显存与吞吐。
             self.vla.vlm = self.vla.vlm.to(torch.bfloat16)
+        else:
+            self.vla.vlm = self.vla.vlm.to(torch.float16)
+
+        self.vla = self.vla.to("cuda").eval()       
+
+
         self.vla = self.vla.to("cuda").eval()
         # global_step 用于按 use_length 复用动作块。
         self.global_step = 0
@@ -258,12 +266,15 @@ class InstructVLAServer:
                 # 指令变化时重置状态机。
                 self.reset(task_label.lower())
 
+        prompt_mode = getattr(cfg, "prompt_mode", "default")
         if self.cfg.use_length == -1 or self.global_step % self.cfg.use_length == 0:
             # 到达动作块刷新时机，重新跑一次完整推理。
+
             action, normalized_actions, cognition_features_current = vla.predict_action(image=processed_images, 
                                                                             instruction=self.task_description,
                                                                             unnorm_key=unnorm_key,
                                                                             do_sample=False,
+                                                                            prompt_mode=prompt_mode,
                                                                             )
             self.last_action_chunk = action
         

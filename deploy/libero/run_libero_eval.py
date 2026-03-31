@@ -178,7 +178,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
             # Reset environment
             env.reset()
-            server.reset(task_description.lower())
+            # server.reset(task_description.lower())
+            if server is not None:
+                server.reset(task_description.lower())
+
             # Set initial states
             obs = env.set_init_state(initial_states[episode_idx])
 

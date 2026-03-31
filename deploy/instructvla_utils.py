@@ -172,7 +172,7 @@ class InstructVLAServer:
         else:
             self.vla.vlm = self.vla.vlm.to(torch.float16)
 
-        self.vla = self.vla.to("cuda").eval()       
+    
 
 
         self.vla = self.vla.to("cuda").eval()

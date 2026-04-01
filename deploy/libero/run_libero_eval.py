@@ -34,6 +34,11 @@ from libero.libero import benchmark
 
 import wandb
 
+
+from PIL import Image
+import numpy as np
+from vla.instructvla_eagle_dual_sys_v2_meta_query_v2_libero_wrist import render_text_on_image
+
 # Append current directory so that interpreter can find Libero.robot
 from deploy.libero.libero_utils import (
     get_libero_dummy_action,
@@ -211,11 +216,22 @@ def eval_libero(cfg: GenerateConfig) -> None:
                     continue
 
                 # Get preprocessed image
+                # img = get_libero_image(obs, resize_size)
+                # wrist_img = get_libero_wrist_image(obs, resize_size)
+
+                # # Save preprocessed image for replay video
+                # replay_images.append(img)
+
+
+
                 img = get_libero_image(obs, resize_size)
                 wrist_img = get_libero_wrist_image(obs, resize_size)
 
-                # Save preprocessed image for replay video
-                replay_images.append(img)
+                video_img = img
+                if cfg.prompt_mode == "image_text_primary":
+                    video_img = np.asarray(render_text_on_image(Image.fromarray(img), task_description))
+
+                replay_images.append(video_img)
 
                 # Prepare observations dict
                 # Note: OpenVLA does not take proprio state as input
@@ -241,6 +257,12 @@ def eval_libero(cfg: GenerateConfig) -> None:
                 # [OpenVLA] The dataloader flips the sign of the gripper action to align with other datasets
                 # (0 = close, 1 = open), so flip it back (-1 = open, +1 = close) before executing the action
                 action = invert_gripper_action(action)
+
+                if not np.isfinite(action).all():
+                    print(f"[ERROR] Non-finite action detected: {action}")
+                    log_file.write(f"[ERROR] Non-finite action detected: {action}\n")
+                    done = False
+                    break
 
                 print('==>action is',action)
                 # Execute action in environment
@@ -303,3 +325,4 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
 if __name__ == "__main__":
     eval_libero()
+

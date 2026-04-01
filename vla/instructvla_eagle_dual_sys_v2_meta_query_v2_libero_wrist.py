@@ -23,7 +23,8 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from prismatic.models.vlms.prismatic import PrismaticVLM
 from prismatic.overwatch import initialize_overwatch
 from prismatic.util.nn_utils import FusedMLPProjector, LinearProjector, MLPProjector
-from transformers import AutoTokenizer, AutoProcessor, AutoModel
+# from transformers import AutoTokenizer, AutoProcessor, AutoModel
+from transformers import AutoTokenizer, AutoProcessor, AutoModel, AutoConfig
 from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from transformers.models.siglip.modeling_siglip import SiglipEncoderLayer
@@ -343,8 +344,9 @@ class InstructVLA(nn.Module):
     def chat(self, *args, **kwargs):
         # chat method from eagle vlm
         # autocast_dtype = torch.bfloat16
-        autocast_dtype = torch.float16
-        with torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
+        # autocast_dtype = torch.float16
+        with torch.no_grad():
+        # with torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
             ret = self.vlm.chat(*args, **kwargs)
         return ret
 
@@ -410,7 +412,8 @@ class InstructVLA(nn.Module):
 
             # extract the last hidden state
             last_hidden_states = output.hidden_states[-1]
-            
+            print("[debug] hidden finite:", torch.isfinite(last_hidden_states).all().item())
+
             # extract the latent action
             meta_feature_mask = (input_ids >= self.min_meta_token) & (input_ids <= self.max_meta_token)
             meta_feature = last_hidden_states[torch.where(meta_feature_mask==1)].view(meta_feature_mask.size(0),-1 , last_hidden_states.shape[-1])
@@ -475,10 +478,60 @@ class InstructVLA(nn.Module):
                 os.path.join(os.path.dirname(__file__), "..", "ckpt", "Eagle2-2B")
             )
 
-        # Load VLM backbone, borrowed from PrismaticVLM
-        vlm = AutoModel.from_pretrained(llm_backbone_id,
-                                        # attn_implementation="flash_attention_2",
-                                        trust_remote_code=True)
+        # # Load VLM backbone, borrowed from PrismaticVLM
+        # vlm = AutoModel.from_pretrained(llm_backbone_id,
+        #                                 # attn_implementation="flash_attention_2",
+        #                                 attn_implementation="eager",
+        #                                 trust_remote_code=True)
+        config = AutoConfig.from_pretrained(
+            llm_backbone_id,
+            trust_remote_code=True,
+        )
+
+        # 强制关闭 flash attention，避免 V100 / 非FA2环境报错
+        config._attn_implementation = "eager"
+        if hasattr(config, "vision_config") and config.vision_config is not None:
+            config.vision_config._attn_implementation = "eager"
+            if hasattr(config.vision_config, "attn_implementation"):
+                config.vision_config.attn_implementation = "eager"
+        if hasattr(config, "llm_config") and config.llm_config is not None:
+            config.llm_config._attn_implementation = "eager"
+            if hasattr(config.llm_config, "attn_implementation"):
+                config.llm_config.attn_implementation = "eager"
+        if hasattr(config, "attn_implementation"):
+            config.attn_implementation = "eager"
+
+        # vlm = AutoModel.from_pretrained(
+        #     llm_backbone_id,
+        #     config=config,
+        #     attn_implementation="eager",
+        #     trust_remote_code=True,
+        # )
+        config = AutoConfig.from_pretrained(
+            llm_backbone_id,
+            trust_remote_code=True,
+        )
+
+        config._attn_implementation = "eager"
+        if hasattr(config, "vision_config") and config.vision_config is not None:
+            config.vision_config._attn_implementation = "eager"
+            if hasattr(config.vision_config, "attn_implementation"):
+                config.vision_config.attn_implementation = "eager"
+        if hasattr(config, "llm_config") and config.llm_config is not None:
+            config.llm_config._attn_implementation = "eager"
+            if hasattr(config.llm_config, "attn_implementation"):
+                config.llm_config.attn_implementation = "eager"
+        if hasattr(config, "attn_implementation"):
+            config.attn_implementation = "eager"
+
+        vlm = AutoModel.from_pretrained(
+            llm_backbone_id,
+            config=config,
+            attn_implementation="eager",
+            trust_remote_code=True
+        )
+
+
 
         processor = EagleProcessor(
             llm_backbone_id,
@@ -599,7 +652,7 @@ class InstructVLA(nn.Module):
 
 
         # autocast_dtype = torch.bfloat16
-        autocast_dtype = torch.float16
+
         pixel_values = None
 
         image, wrist_image = image
@@ -637,11 +690,13 @@ class InstructVLA(nn.Module):
         if pixel_values is None:
             # Preprocess Image
             pixel_values = inputs['pixel_values']
-            pixel_values = pixel_values.to(self.vlm.device, dtype=autocast_dtype)
+            # pixel_values = pixel_values.to(self.vlm.device, dtype=autocast_dtype)
+            pixel_values = pixel_values.to(self.vlm.device, dtype=torch.float32)
 
         # Generate cognition feature through vlm
         if cache_latent is False or (cache_latent is True and (self.run_index % 5 == 0 or self.latent is None)):
-            with torch.no_grad(), torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
+            # with torch.no_grad(), torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
+            with torch.no_grad():    
                 attention_mask = input_ids.ne(-10)
                 output: CausalLMOutputWithPast = self.vlm(
                     input_ids=input_ids,
@@ -657,22 +712,28 @@ class InstructVLA(nn.Module):
 
             # Extract cognition feature
             last_hidden_states = output.hidden_states[-1]
+            print("[debug] hidden finite:", torch.isfinite(last_hidden_states).all().item())
             self.latent = last_hidden_states.detach()
         else:
             last_hidden_states = self.latent
             
         meta_feature_mask = (input_ids >= self.min_meta_token) & (input_ids <= self.max_meta_token)
         meta_feature = last_hidden_states[torch.where(meta_feature_mask==1)].view(meta_feature_mask.size(0),-1 , last_hidden_states.shape[-1])
+        print("[debug] meta_feature finite:", torch.isfinite(meta_feature).all().item())
+
         # Sample random noise
         BS, step, dim = meta_feature.shape
 
         sys1_pixel_values = dict(dino = torch.stack([self.action_model.default_dino_transform(i) \
                                                      for i in [image, wrist_image]]).to(self.vlm.device))
-
-        with torch.no_grad(), torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
+        print("[debug] sys1_pixel_values finite:", torch.isfinite(sys1_pixel_values["dino"]).all().item())
+        
+        # with torch.no_grad(), torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
+        with torch.no_grad():    
             samples = self.action_model.sampling(   latent_action = meta_feature,
                                                     pixel_values = sys1_pixel_values,
                                                     )
+            print("[debug] samples finite:", torch.isfinite(samples).all().item())
         normalized_actions = samples[0].float().cpu().numpy()
 
         # Un-normalize Actions        
@@ -686,6 +747,10 @@ class InstructVLA(nn.Module):
             0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
             normalized_actions,
         )
+        print("[debug] normalized finite:", np.isfinite(normalized_actions).all())
+        print("[debug] actions finite:", np.isfinite(actions).all())
+        print("[debug] first action:", actions[0] if len(actions) > 0 else actions) 
+
         self.run_index += 1
         cleanup_xlora_pre_hooks(self.vlm.language_model)
         return actions, normalized_actions, meta_feature
@@ -999,6 +1064,7 @@ def load(
     vlm = AutoModel.from_pretrained(
         llm_backbone_id,
         # attn_implementation="flash_attention_2",
+        attn_implementation="eager",
         trust_remote_code=True
         )
 
@@ -1119,5 +1185,9 @@ def load_vla(
     )
     
     return vla
+
+
+
+
 
 

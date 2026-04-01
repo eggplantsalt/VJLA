@@ -167,15 +167,16 @@ class InstructVLAServer:
         # if self.cfg.use_bf16:
         #     # 仅把语言视觉主干切到 bf16，兼顾显存与吞吐。
         #     self.vla.vlm = self.vla.vlm.to(torch.bfloat16)
-        if self.cfg.use_bf16:
-            self.vla.vlm = self.vla.vlm.to(torch.bfloat16)
-        else:
-            self.vla.vlm = self.vla.vlm.to(torch.float16)
+        
+        
+        # if self.cfg.use_bf16:
+        #     self.vla.vlm = self.vla.vlm.to(torch.bfloat16)
+        # else:
+        #     self.vla.vlm = self.vla.vlm.to(torch.float16)
 
-    
+        self.vla = self.vla.to(device="cuda", dtype=torch.float32).eval()
 
-
-        self.vla = self.vla.to("cuda").eval()
+        # self.vla = self.vla.to("cuda").eval()
         # global_step 用于按 use_length 复用动作块。
         self.global_step = 0
         self.last_action_chunk = None
@@ -289,5 +290,6 @@ class InstructVLAServer:
         self.global_step+=1
 
         return action
+
 
 

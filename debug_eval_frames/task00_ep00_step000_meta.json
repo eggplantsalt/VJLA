@@ -1,0 +1,9 @@
+{
+  "task_id": 0,
+  "episode_idx": 0,
+  "policy_step": 0,
+  "task_description": "open the middle drawer of the cabinet",
+  "raw_primary_path": "./debug_eval_frames/task00_ep00_step000_primary_raw.png",
+  "raw_wrist_path": "./debug_eval_frames/task00_ep00_step000_wrist_raw.png",
+  "preview_overlay_path": "./debug_eval_frames/task00_ep00_step000_preview_overlay.png"
+}

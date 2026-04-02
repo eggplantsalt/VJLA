@@ -17,8 +17,11 @@ Usage:
         --wandb_entity <ENTITY>
 """
 
+# export PYTHONPATH=/storage/v-xiangxizheng/zy_workspace/VJLA:/storage/v-xiangxizheng/zy_workspace/VJLA/libero:$PYTHONPATH
+
 import os
 import sys
+import json
 parent_dir = os.path.dirname(os.getcwd())
 sys.path.insert(0, parent_dir)
 sys.path.insert(0, os.getcwd())
@@ -107,6 +110,16 @@ class GenerateConfig:
 
     # fmt: on
 
+
+    #added
+    dump_eval_frame: bool = False
+    dump_task_id: int = 0
+    dump_episode_idx: int = 0
+    dump_policy_step: int = 0
+    dump_frame_dir: str = "./debug_eval_frames"
+
+
+    
 
 @draccus.wrap()
 def eval_libero(cfg: GenerateConfig) -> None:
@@ -222,10 +235,71 @@ def eval_libero(cfg: GenerateConfig) -> None:
                 # # Save preprocessed image for replay video
                 # replay_images.append(img)
 
-
-
                 img = get_libero_image(obs, resize_size)
                 wrist_img = get_libero_wrist_image(obs, resize_size)
+
+
+                """
+                下面这一段你的作用是：在评测过程中定期落盘当前帧的原始图像、指令文本和一张带字的预览图，方便你肉眼检查模型输入和环境状态，快速定位问题。
+                你可以通过调整 `dump_eval_frame`, `dump_task_id`, `dump_episode_idx`, `dump_policy_step` 这几个参数来控制落盘的时机（比如只落盘特定任务、特定 episode、特定 step 的帧）。
+                
+                原始主视角图
+                原始 wrist 图
+                instruction.txt
+                一张肉眼检查用的 overlay 预览图
+                一个 meta.json
+                """
+            
+                policy_step = t - cfg.num_steps_wait
+
+                if (
+                    cfg.dump_eval_frame
+                    and task_id == cfg.dump_task_id
+                    and episode_idx == cfg.dump_episode_idx
+                    and policy_step == cfg.dump_policy_step
+                ):
+                    os.makedirs(cfg.dump_frame_dir, exist_ok=True)
+
+                    stem = f"task{task_id:02d}_ep{episode_idx:02d}_step{policy_step:03d}"
+
+                    raw_primary_path = os.path.join(cfg.dump_frame_dir, f"{stem}_primary_raw.png")
+                    raw_wrist_path = os.path.join(cfg.dump_frame_dir, f"{stem}_wrist_raw.png")
+                    instruction_path = os.path.join(cfg.dump_frame_dir, f"{stem}_instruction.txt")
+                    meta_path = os.path.join(cfg.dump_frame_dir, f"{stem}_meta.json")
+                    preview_overlay_path = os.path.join(cfg.dump_frame_dir, f"{stem}_preview_overlay.png")
+
+                    # 保存原始图
+                    Image.fromarray(img).save(raw_primary_path)
+                    Image.fromarray(wrist_img).save(raw_wrist_path)
+
+                    # 保存一张“仅供肉眼检查”的带字预览图
+                    preview_overlay = np.asarray(render_text_on_image(Image.fromarray(img), task_description))
+                    Image.fromarray(preview_overlay).save(preview_overlay_path)
+
+                    # 保存 instruction
+                    with open(instruction_path, "w", encoding="utf-8") as f:
+                        f.write(task_description.strip() + "\n")
+
+                    # 保存元信息
+                    with open(meta_path, "w", encoding="utf-8") as f:
+                        json.dump(
+                            {
+                                "task_id": task_id,
+                                "episode_idx": episode_idx,
+                                "policy_step": policy_step,
+                                "task_description": task_description,
+                                "raw_primary_path": raw_primary_path,
+                                "raw_wrist_path": raw_wrist_path,
+                                "preview_overlay_path": preview_overlay_path,
+                            },
+                            f,
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+
+                    print(f"[Dumped raw frame] {raw_primary_path}")
+                    print(f"[Dumped instruction] {instruction_path}")
+
 
                 video_img = img
                 if cfg.prompt_mode == "image_text_primary":
@@ -325,4 +399,5 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
 if __name__ == "__main__":
     eval_libero()
+
 

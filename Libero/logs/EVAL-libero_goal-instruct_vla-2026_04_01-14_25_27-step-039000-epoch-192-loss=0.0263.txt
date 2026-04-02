@@ -1,0 +1,10 @@
+Task suite: libero_goal
+
+Task: open the middle drawer of the cabinet
+Starting episode 1...
+Saved rollout MP4 at path ./Libero/rollouts/libero_goal-2026_04_01-14_25_27-step-039000-epoch-192-loss=0.0263/2026_04_01-14_25_27--episode=1--success=False--task=open_the_middle_drawer_of_the_cabinet.mp4
+Success: False
+# episodes completed so far: 1
+# successes: 0 (0.0%)
+Current task success rate: 0.0
+Current total success rate: 0.0

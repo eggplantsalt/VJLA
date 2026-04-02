@@ -1,8 +1,10 @@
 # save as: tools/test_instructvla_ocr.py
 
 import os
+import json
 import argparse
 import textwrap
+import traceback
 import numpy as np
 import torch
 
@@ -11,8 +13,22 @@ from PIL import Image, ImageDraw, ImageFont
 from vla.instructvla_eagle_dual_sys_v2_meta_query_v2_libero_wrist import load_vla
 
 
-def center_crop_image_keep_pil(image: Image.Image, crop_scale: float = 0.9, out_size: int = 224) -> Image.Image:
-    """尽量复刻 deploy/instructvla_utils.py 的评测前处理：center crop + resize to 224."""
+DEFAULT_SYSTEM_MESSAGE = "You are a helpful assistant."
+
+
+def choose_infer_dtype() -> torch.dtype:
+    """Pick BF16 when supported, otherwise FP16 (e.g. V100)."""
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
+
+def center_crop_image_keep_pil(
+    image: Image.Image,
+    crop_scale: float = 0.9,
+    out_size: int = 224,
+) -> Image.Image:
+    """Approximate deploy-time preprocessing: center crop + resize to 224."""
     w, h = image.size
     new_w = int(w * crop_scale ** 0.5)
     new_h = int(h * crop_scale ** 0.5)
@@ -30,10 +46,10 @@ def render_text_on_image(
     margin: int = 12,
     max_chars_per_line: int = 22,
 ):
-    """把指令渲染到图像顶部白底条上。"""
+    """Render instruction text on a white banner above the image."""
     image = image.convert("RGB")
     wrapped_lines = textwrap.wrap(text, width=max_chars_per_line)
-    wrapped_text = "\n".join(wrapped_lines)
+    wrapped_text = "\n".join(wrapped_lines) if wrapped_lines else text
 
     try:
         font = ImageFont.truetype("DejaVuSans.ttf", font_size)
@@ -57,13 +73,20 @@ def render_text_on_image(
     draw = ImageDraw.Draw(canvas)
     x = (new_w - text_w) // 2
     y = margin
-    draw.multiline_text((x, y), wrapped_text, fill="black", font=font, spacing=6, align="center")
+    draw.multiline_text(
+        (x, y),
+        wrapped_text,
+        fill="black",
+        font=font,
+        spacing=6,
+        align="center",
+    )
 
     return canvas, font_name
 
 
 def horizontal_concat(images):
-    """横向拼接多张图，顶部对齐。"""
+    """Concatenate images horizontally, top-aligned."""
     images = [im.convert("RGB") for im in images]
     total_w = sum(im.width for im in images)
     max_h = max(im.height for im in images)
@@ -76,8 +99,9 @@ def horizontal_concat(images):
 
 
 def build_prompt(user_text, image_np):
+    """Build prompt in the same role-based format used elsewhere in project."""
     return [
-        {"content": "You are a helpful assistant."},
+        {"role": "system", "content": DEFAULT_SYSTEM_MESSAGE},
         {
             "role": "user",
             "content": user_text,
@@ -86,18 +110,82 @@ def build_prompt(user_text, image_np):
     ]
 
 
+def infer_action_shape_args(
+    model_path: str,
+    action_dim=None,
+    future_action_window_size=None,
+    past_action_window_size=None,
+):
+    """Infer action head shape args from run config unless explicitly provided."""
+    inferred = {
+        "action_dim": action_dim,
+        "future_action_window_size": future_action_window_size,
+        "past_action_window_size": past_action_window_size,
+    }
+
+    ckpt_abs = os.path.abspath(model_path)
+    run_dir = os.path.dirname(os.path.dirname(ckpt_abs))
+    config_path = os.path.join(run_dir, "config.json")
+
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        if inferred["action_dim"] is None:
+            inferred["action_dim"] = cfg.get("action_dim")
+        if inferred["future_action_window_size"] is None:
+            inferred["future_action_window_size"] = cfg.get("future_action_window_size")
+        if inferred["past_action_window_size"] is None:
+            inferred["past_action_window_size"] = cfg.get("past_action_window_size")
+
+    if inferred["action_dim"] is None:
+        inferred["action_dim"] = 7
+    if inferred["future_action_window_size"] is None:
+        inferred["future_action_window_size"] = 7
+    if inferred["past_action_window_size"] is None:
+        inferred["past_action_window_size"] = 0
+
+    return inferred
+
+
+def debug_inputs(inputs):
+    for k, v in inputs.items():
+        if torch.is_tensor(v):
+            print(f"[DEBUG] {k}.shape = {tuple(v.shape)}, dtype = {v.dtype}")
+        else:
+            print(f"[DEBUG] {k} = {type(v)}")
+
+
 @torch.no_grad()
-def ask_model(model, prompt_messages, max_new_tokens=128):
+def ask_model(model, prompt_messages, max_new_tokens=128, debug=False):
     inputs = model.processor.prepare_input(dict(prompt=prompt_messages))
-    dtype = torch.bfloat16
+
+    if debug:
+        debug_inputs(inputs)
+
+    dtype = choose_infer_dtype()
+    print(f"[Infer dtype] {dtype}")
+
+    input_ids = inputs["input_ids"].cuda()
+    pixel_values = inputs["pixel_values"].cuda()
+
+    attention_mask = inputs.get("attention_mask", None)
+    if attention_mask is None:
+        attention_mask = input_ids.ne(-10)
+    attention_mask = attention_mask.cuda()
+
+    if debug:
+        print(f"[DEBUG] input_ids.shape: {tuple(input_ids.shape)}")
+        print(f"[DEBUG] attention_mask.shape: {tuple(attention_mask.shape)}")
+        print(f"[DEBUG] pixel_values.shape: {tuple(pixel_values.shape)}")
 
     with torch.autocast("cuda", dtype=dtype, enabled=True):
         output = model.vlm.generate(
-            input_ids=inputs["input_ids"].cuda(),
-            attention_mask=inputs["attention_mask"].cuda(),
-            pixel_values=inputs["pixel_values"].cuda(),
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
             max_new_tokens=max_new_tokens,
             output_hidden_states=False,
+            return_dict_in_generate=False,
         )
 
     response = model.processor.tokenizer.decode(output[0], skip_special_tokens=False)
@@ -110,27 +198,55 @@ def main():
     parser.add_argument("--primary_image", type=str, required=True)
     parser.add_argument("--wrist_image", type=str, default=None)
     parser.add_argument("--instruction", type=str, default="open the drawer")
+    parser.add_argument("--instruction_file", type=str, default=None)
+
     parser.add_argument("--use_center_crop", action="store_true")
     parser.add_argument("--render_text", action="store_true")
     parser.add_argument("--concat_wrist", action="store_true")
+
     parser.add_argument("--save_debug_image", type=str, default="debug_ocr_input.png")
     parser.add_argument("--font_size", type=int, default=36)
     parser.add_argument("--max_chars_per_line", type=int, default=22)
-    parser.add_argument("--instruction_file", type=str, default=None)
+
+    parser.add_argument("--action_dim", type=int, default=None)
+    parser.add_argument("--future_action_window_size", type=int, default=None)
+    parser.add_argument("--past_action_window_size", type=int, default=None)
+
+    parser.add_argument("--max_new_tokens", type=int, default=128)
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--single_question", type=str, default=None)
+
     args = parser.parse_args()
+
     instruction = args.instruction
     if args.instruction_file is not None:
         with open(args.instruction_file, "r", encoding="utf-8") as f:
             instruction = f.read().strip()
 
+    shape_args = infer_action_shape_args(
+        args.model_path,
+        action_dim=args.action_dim,
+        future_action_window_size=args.future_action_window_size,
+        past_action_window_size=args.past_action_window_size,
+    )
+    print(
+        "[Action head args] "
+        f"action_dim={shape_args['action_dim']}, "
+        f"future_action_window_size={shape_args['future_action_window_size']}, "
+        f"past_action_window_size={shape_args['past_action_window_size']}"
+    )
+
+    infer_dtype = choose_infer_dtype()
+    print(f"[Model dtype target] {infer_dtype}")
+
     model = load_vla(
         args.model_path,
         load_for_training=False,
-        future_action_window_size=7,
-        past_action_window_size=0,
-        action_dim=7,
+        future_action_window_size=shape_args["future_action_window_size"],
+        past_action_window_size=shape_args["past_action_window_size"],
+        action_dim=shape_args["action_dim"],
     )
-    model = model.to(device="cuda", dtype=torch.float32).eval()
+    model = model.to(device="cuda", dtype=infer_dtype).eval()
 
     primary = Image.open(args.primary_image).convert("RGB")
     wrist = Image.open(args.wrist_image).convert("RGB") if args.wrist_image else None
@@ -158,6 +274,7 @@ def main():
     print(f"[Saved debug image] {args.save_debug_image}")
     if font_name is not None:
         print(f"[Font used] {font_name}")
+    print(f"[Final image size] {final_img.size}")
 
     image_np = np.asarray(final_img)
 
@@ -171,15 +288,30 @@ def main():
         ),
     ]
 
+    if args.single_question is not None:
+        tests = [("[Single question]", args.single_question)]
+
     for title, q in tests:
         print("=" * 80)
         print(title)
         print("USER:", q)
         messages = build_prompt(q, image_np)
-        resp = ask_model(model, messages)
-        print("MODEL:", resp)
+
+        try:
+            resp = ask_model(
+                model,
+                messages,
+                max_new_tokens=args.max_new_tokens,
+                debug=args.debug,
+            )
+            print("MODEL:", resp)
+        except Exception as e:
+            print("[ERROR] generation failed")
+            print(type(e).__name__, str(e))
+            if args.debug:
+                traceback.print_exc()
+            break
 
 
 if __name__ == "__main__":
     main()
-

@@ -445,7 +445,8 @@ class InstructVLA(nn.Module):
 
         # 加载基础 VLM 骨干。
         vlm = AutoModel.from_pretrained(llm_backbone_id,
-                                        attn_implementation="flash_attention_2",
+                                        # attn_implementation="flash_attention_2",
+                                        attn_implementation="eager",
                                         trust_remote_code=True)
 
         processor = EagleProcessor(
@@ -1195,7 +1196,8 @@ def load(
 
     vlm = AutoModel.from_pretrained(
         llm_backbone_id,
-        attn_implementation="flash_attention_2",
+        # attn_implementation="flash_attention_2",
+        attn_implementation="eager",
         trust_remote_code=True
         )
 
@@ -1316,5 +1318,6 @@ def load_vla(
     )
 
     return vla
+
 
 

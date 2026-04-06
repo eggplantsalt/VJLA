@@ -1264,7 +1264,6 @@ def model_forward(self):
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
         """Qwen2 兼容前向。
-
         fast_loss_cal=True 时，仅在 labels 非 ignore_index 的位置计算 lm_head，
         可显著减少大词表投影开销。
         """

@@ -1,34 +1,5 @@
-"""InstructVLA 主模型实现（meta query v2）。
-
-该文件包含：
-1) InstructVLA 模型主体（语言 + 动作双分支）
-2) RLDS batch transform 与动作训练 collator
-3) 模型与数据加载入口（load / load_vla）
-
-
-一、 该文件在整个工程目录中的核心定位
-
-这个文件 instructvla_eagle_dual_sys_v2_meta_query_v2.py 是整个 InstructVLA 项目的“中枢神经系统（Core Architecture Definition）”。
-
-在工程目录中，如果说其他脚本（如 data_pipeline）是负责搬运食材的，scripts/train_...py 是负责按下启动开关的，那么这个文件就是定义整个模型长什么样、怎么运转的绝对核心。它主要实现了三大物理模块：
-
-    模型本体组装 (class InstructVLA)：
-        将庞大的视觉语言模型（self.vlm）和负责输出物理坐标的动作多层感知机（self.action_model）强行拼接在同一个 PyTorch nn.Module 下。
-        定义了训练时的显存计算图流向（forward 方法）：如何同时计算自然语言的交叉熵损失和动作坐标的 Flow-Matching 损失。
-        定义了上机实测时的前向推理逻辑（predict_action 方法）：即之前为你详细拆解过的，从“打字机模式”切换到“提取隐式张量并解码为动作坐标”的完整流水线。
-
-        
-
-    训练数据格式化组装 (RLDSBatchTransform, PaddedCollatorForActionPrediction)：
-        拦截从底层 RLDS（真实机器人轨迹数据集）传来的杂乱视频帧和坐标。
-        根据当前处于 Stage 1 还是 Stage 2，按概率动态决定生成哪种 Prompt（是直接输出动作，还是先生成思维链再输出动作），并最终将所有长度不一的序列用 0 或 -100 填充对齐（Padding），打包成方方正正的巨型 Tensor 矩阵送入显卡。
-
-        
-        
-    工程实例加载器 (load, load_vla)：
-        绕过 Hugging Face 默认的加载限制，强制向字典中注入 64 个新增的 <new_token_x>，并从硬盘读取各个碎片的权重矩阵（LoRA 矩阵、动作头矩阵等）拼装成完整的模型实例。
-
-
+"""
+cogactvla.py
 
 """
 
@@ -112,15 +83,7 @@ class InstructVLA(nn.Module):
         stage = "stage1",
         **kwargs,
     ) -> None:
-        """初始化 InstructVLA。
-
-        关键参数:
-        - stage: stage1=LoRA, stage2=X-LoRA
-        - meta_token_ids: 承载动作认知特征的 token 范围
-        """
         super().__init__()
-
-        # 实例化一个action axpert：把latent token + 视觉特征映射为未来动作序列。
         self.action_model = ActionModel(token_size,past_action_window_size,future_action_window_size,action_dim)
         
         self.vlm = vlm
@@ -128,13 +91,12 @@ class InstructVLA(nn.Module):
         self.tokenizer = tokenizer
         self.config_json = config_json
         self.token_size = token_size
-        self.future_action_window_size = future_action_window_size #action chunk
-        self.past_action_window_size = past_action_window_size #提供物理原点锚定。视觉网络只能计算出物体在图像中的相对二维像素偏移。如果没有 past_action_window_size 提供当前机械臂的真实物理状态，模型算出的未来 15 帧坐标将是没有参考系的“悬空数据”。注入这 1 帧历史数据，动作解码器才能在内部数学空间中，将未来的预测轨迹与实体机械臂当前的绝对坐标系完成精准的矩阵对齐。
+        self.future_action_window_size = future_action_window_size
+        self.past_action_window_size = past_action_window_size
 
         self.all_module_keys = ['action_model']
         for module_keys in ["vision_model", "language_model", "mlp1"]:
             self.all_module_keys.append("vlm." + module_keys)
-            #all_module_keys = ['action_model', 'vlm.vision_model', 'vlm.language_model', 'vlm.mlp1']
 
         # Diffusion head is always trainable
         self._trainable_module_keys = ['action_model']
@@ -145,30 +107,8 @@ class InstructVLA(nn.Module):
         keys += self._trainable_module_keys
         self.trainable_module_keys = keys
 
-
-
-        # norm_stats 到底是什么？（物理翻译官）
-        # self.norm_stats 就是夹在“数字大脑”和“物理电机”之间的翻译字典（统计量边界表）。
-        # 它里面存储了什么？它记录了你这台真实机器人在人类遥控它录制训练数据时，每一个关节曾经达到过的物理极限值（最大值和最小值）。
-        # 例如，norm_stats 内部的数据结构类似于：
-        # 关节 1（前后移动）：最小值 Low = -1.5 米，最大值 High = 2.5 米
-        # 关节 2（夹爪开合）：最小值 Low = 0.0 米，最大值 High = 0.1 米
-        # 最后一步的物理转换（反归一化 / Unnormalization）： 当大脑输出一个归一化数字（如 Xnorm​=0.5）时，系统会立刻翻开 norm_stats 这本字典，套用真实的物理极限边界，通过以下数学公式将其还原为真实的物理尺寸：
-
         self.norm_stats = norm_stats
-
-
-
-        # 替换语言模型 forward 为加速版本（仅计算必要位置 loss）。
-        # 工程解释：在标准的 Qwen2 语言模型中，计算损失（Loss）时，系统会把整句话的所有 Token 都拿去和拥有十几万个词汇的超大词表矩阵相乘，生成一个极其庞大的 Logits 矩阵。
-        # 在 InstructVLA 的多模态训练中，序列非常长（包含大量图像特征），如果用官方的 forward，这层庞大的矩阵乘法会瞬间撑爆 A100 的 80G 显存（OOM）。
-        # 通过调用自写的 model_forward 强行替换原方法，系统在底层执行了一个逻辑：在进行最后那步庞大的矩阵相乘前，先检查标签中是否为 -100（即不需要计算损失的部分，如用户的提问和图像本身）。把这些部分的隐藏层张量直接丢弃，只对真正需要预测的 Token 计算概率分布。 这是一种极限压榨显存的黑客级优化。
         self.vlm.language_model.forward = model_forward(self.vlm.language_model)
-
-
-        # 物理作用：向分布式训练框架出示“身份证”。
-        # 工程解释：InstructVLA 这种百亿参数的模型必须用多张显卡切片训练（FSDP, Fully Sharded Data Parallel）。FSDP 框架在切分模型时，需要知道“到底在哪一层把网络切断分布到不同显卡上”。
-        # 这行代码显式地把 Qwen2DecoderLayer 这个类的名字挂在模型属性上。你在后面 get_fsdp_wrapping_policy 方法中会看到，FSDP 框架会读取这个属性，然后精确地把模型一层一层地拆解到不同的 GPU 显存里。
         self.vlm.language_model.transformer_layer_cls = Qwen2DecoderLayer
         
 
@@ -178,14 +118,12 @@ class InstructVLA(nn.Module):
         self.min_meta_token = self.meta_token_ids[0]
         self.max_meta_token = self.meta_token_ids[-1]
 
-        # 根据 stage 配置训练策略。
+        # Freeze all parameters in the model
         if stage == "stage1":
             overwatch.info("Train the model in stage 1 with lora and learnable embeddings")
             for param in self.vlm.parameters():
                 param.requires_grad = False
 
-
-            #后面通常会配合 get_peft_model(self.vlm.language_model, lora_config) 使用
             lora_config = LoraConfig(
                     r=128,
                     lora_alpha=256,
@@ -197,72 +135,24 @@ class InstructVLA(nn.Module):
                 )
             
             # Unfreeze only the new tokens' embeddings
-            # 调用分词器（Tokenizer）的查找表（Lookup Table）。分词器会检索这些字符串在扩充后的词表（Vocabulary）中对应的整数索引（Integer IDs）。
-            # 结果：由于这些 Token 是后来才加入的，它们通常被分配到词表最末端的连续编号（例如 151643 到 151706）
-            new_token_ids = self.tokenizer.convert_tokens_to_ids(self.tokenizer.new_tokens)  
+            
+            self.vlm.language_model = get_peft_model(self.vlm.language_model, lora_config)
 
+            new_token_ids = self.tokenizer.convert_tokens_to_ids(self.tokenizer.new_tokens)  # Convert new tokens to their respective ids
             new_token_ids = torch.tensor(new_token_ids, device=self.vlm.language_model.base_model.model.lm_head.weight.device)
 
             # we unfreeze the embed and lm_head, but not all parameters are finetuned, the trainable weight are less than the reported weight
-            # 以 self.vlm.language_model.base_model.model.lm_head.weight 为例：
-            # self.vlm：InstructVLA 定义的整个视觉语言模型实例。
-            # .language_model：VLM 内部负责文本处理的部分（通常是 Qwen 或 Llama）。
-            # .base_model：【关键转折点】。因为代码前面执行了 get_peft_model()，原模型被 PEFT 库接管了。PEFT 会创建一个包装类，真正的原始模型被塞进了一个叫 base_model 的属性里。
-            # .model：这是 PEFT 内部 LoraModel 类的固定属性，指向它所包装的实际 PyTorch 模型。
-            # .lm_head (或 .model.embed_tokens)：这才是回归到 Qwen2/Llama 原生定义的层名称。这俩一头一尾
-            # .weight：该层真实的参数矩阵（张量）。
-            # .requires_grad = True：物理操作——在显存计算图中把这个矩阵的“只读”开关关掉，允许梯度流入。
-
-            # 一、 关于 原生模型.model 
-            # 结论：代码里 self.vlm.language_model.base_model.model.model.embed_tokens 并没有多写一个 .model，它是完全准确的物理路径。
-            # 这就需要拆解 Hugging Face 库在定义大语言模型（如 Qwen2、Llama）时的双层类架构标准。
-            # 1. 原生模型除了 .model 还有什么？
-            # 当你加载一个 Qwen2ForCausalLM 时，这个类的实例化对象在内存中只包含两个核心组件（属性）：
-            # .model：这是真正干活的 Transformer 主干网络（属于 Qwen2Model 类）。它里面包含了词嵌入层（embed_tokens）、几十层隐藏层（Attention + MLP）以及最后的层归一化（LayerNorm）。
-            # .lm_head：这是收尾的输出头（属于 nn.Linear 类）。它与 .model 是并列的。
-            # 2. 为什么路径里会出现两个连续的 .model？
-            # 这是 PEFT 库和 Hugging Face 库的命名冲突导致的嵌套。我们重新逐层映射一次精确的内存地址：
-            # self.vlm.language_model → 指向 PeftModel（PEFT 库最外层封装）。
-            # .base_model → 指向 LoraModel（PEFT 库的中间层）。
-            # .model → 指向 Qwen2ForCausalLM（这是 Hugging Face 定义的原生模型外壳）。
-            # 再.model → 指向 Qwen2Model（这是 Hugging Face 定义的主干网络，它与 lm_head 是并列关系）。
-            # .embed_tokens → 最终定位到词嵌入矩阵。
-            # 对比验证：
-            # 访问头部的路径：...base_model.model.model.embed_tokens（必须进到主干网络里找）。
-            # 访问尾部的路径：...base_model.model.lm_head（只需在外壳层就能找到，因为 lm_head 和主干网络 .model 是平级的）。
-            self.vlm.language_model = get_peft_model(self.vlm.language_model, lora_config)
-
-
-
-
             self.vlm.language_model.base_model.model.lm_head.weight.requires_grad = True
             self.vlm.language_model.base_model.model.model.embed_tokens.weight.requires_grad = True
 
-            #通过掩码的方式，只更新新加入的learnable tokens对应的梯度
             def mask_old_token_grad(grad: torch.Tensor):
-                # 仅更新新增 meta token 对应的梯度，旧词表梯度清零。
                 mask = torch.ones(grad.shape[0], dtype=torch.bool, device=grad.device)
-                mask[new_token_ids] = False #mask = [True, True, True, False, False]。
-                grad[mask] = 0#凡是 mask 为 True 的位置（索引 0, 1, 2的旧词汇），其梯度数值全部被强制覆写为 0.0
+                mask[new_token_ids] = False 
+                grad[mask] = 0
                 return grad
 
             self.vlm.language_model.base_model.model.lm_head.weight.register_hook(mask_old_token_grad)
             self.vlm.language_model.base_model.model.model.embed_tokens.weight.register_hook(mask_old_token_grad)
-
-
-            # register_hook 是 PyTorch 中对张量（Tensor）提供的一个底层 API。 物理功能：在反向传播（Backward Pass）计算梯度的过程中，强制插入一段自定义的代码逻辑，以实时读取或修改梯度数值。
-            # 1. 运行机制的物理事实
-            # 在正常的神经网络中，执行 loss.backward() 时，底层 CUDA 算子会从最后一层开始，逐层往前计算梯度。
-            # 一旦某个张量被调用了 .register_hook(func)，系统会在计算图（Computation Graph）的该节点上挂载一个回调函数 func。
-            # 当反向传播的张量流经过这个节点时，系统会暂停计算，将当前的梯度张量传入 func 中执行，然后再拿着 func 返回的新张量继续往下传。
-
-
-
-            # 梯度在网络中不是一整块往下流的水，它在每一层都会分叉：一半变成修改自己权重的指令（留在原地），一半变成误差信号（继续回传）。
-            # 你的 Hook 绑在 weight 上，就只能拦截并修改留在原地的“权重修改指令”。误差信号依然畅通无阻地流到了第一层。因此，你必须在流水线的第一道工序和最后一道工序各自设立一个独立的拦截站，才能彻底锁死旧词汇的物理更改权限。
-
-
-
 
 
         elif stage == "stage2":
@@ -276,29 +166,6 @@ class InstructVLA(nn.Module):
                 os.path.join(os.path.dirname(__file__), "..", "ckpt", "empty_language_adapter")
             )
 
-            # 一、 代码张量的物理拼接过程
-            # __file__
-            # 物理定义：Python 的系统内置变量。它硬编码了当前正在执行的这段代码所在文件的具体物理位置。
-            # 当前值：/你的工程根目录/InstructVLA/vla/instructvla_eagle_dual_sys_v2_meta_query_v2.py。
-
-            # os.path.dirname(__file__)
-            # 物理操作：剥离文件名，提取该文件所在的目录（即提取当前脚本的父层级）。
-            # 计算结果：/你的工程根目录/InstructVLA/vla。
-
-            # os.path.join(..., "..", "ckpt", "empty_language_adapter")
-            # 物理操作：执行路径字符串的拼接。".." 在操作系统中代表“向上一级目录”。
-            # 计算结果：/你的工程根目录/InstructVLA/vla/../ckpt/empty_language_adapter。
-
-            # os.path.abspath(...)
-            # 物理操作：执行路径规范化计算。它会读取操作系统底层规则，把路径中的 ..（上一级）进行物理抵消。也就是获取绝对路径。
-            # 最终产出：/你的工程根目录/InstructVLA/ckpt/empty_language_adapter.
-
-
-
-
-
-            # Adapter "0"（语言/视觉推理专家）：在 Stage 2 中，这是一个由 0 初始化的全新矩阵。它的物理任务是专门吸收和学习“复杂的多步逻辑推理”与“图像细节问答”。
-            # Adapter "1"（物理动作控制专家）：根据代码下方的警告日志 (overwatch.warning)，这个位置在实际加载时，必须被替换为 Stage 1 训练出的、已经完全掌握机器人动作坐标的那个 LoRA 权重。
             lora_config = XLoraConfig(
                 task_type="CAUSAL_LM",
                 hidden_size=token_size,
@@ -323,73 +190,33 @@ class InstructVLA(nn.Module):
             new_token_ids = self.tokenizer.convert_tokens_to_ids(self.tokenizer.new_tokens)
 
             new_token_ids = torch.tensor(new_token_ids, device=self.vlm.language_model.base_model.model.lm_head.weight.device)
-
-
-
             # we unfreeze the embed and lm_head, but not all parameters are finetuned, the trainable weight are less than the reported weight
-            self.vlm.language_model.base_model.model.lm_head.weight.requires_grad = True#lm_head就是language modelling head
+            self.vlm.language_model.base_model.model.lm_head.weight.requires_grad = True
             self.vlm.language_model.base_model.model.model.embed_tokens.weight.requires_grad = True
 
-            #定义一个掩码函数，把传入的梯度里不是新加token<latent action query>的部分全部掩码掉
             def mask_old_token_grad(grad: torch.Tensor):
-                # stage2 同样限制旧词表梯度，降低语言能力退化风险。
                 mask = torch.ones(grad.shape[0], dtype=torch.bool, device=grad.device)
                 mask[new_token_ids] = False 
                 grad[mask] = 0
                 return grad
-            #这个函数传入模型lm_head和embed_tokens的权重矩阵的 register_hook 中，确保在反向传播过程中，只有新加入的 meta token 对应的梯度会被保留，旧词表的梯度会被强制清零，从而实现只微调新 token 的目标，同时最大程度地保护原有语言模型的能力不受损害。
+
             self.vlm.language_model.base_model.model.lm_head.weight.register_hook(mask_old_token_grad)
             self.vlm.language_model.base_model.model.model.embed_tokens.weight.register_hook(mask_old_token_grad)
 
-
-            # 为什么可以通过名字里有没有 lora_ 来判断并解冻梯度？
-            # 这依赖于 PyTorch 底层的参数命名空间注册机制（Parameter Namespace Registration）以及 PEFT 库的硬编码规范。
-            # 物理事实：张量在显存中是有“门牌号”的 在 PyTorch 中，当你定义一个神经网络时，每一个包含权重的子模块（如 nn.Linear）在物理内存中被实例化时，系统都会为其分配一个唯一的字符串路径（即门牌号）。 调用 .named_parameters() 方法时，系统会返回一个生成器，吐出每一对 (名字字符串, 真实的张量数据)。
-            # PEFT 库的硬编码规则 在基座模型被 PEFT 包装（即挂载 LoRA 矩阵）时，PEFT 库在底层 C++/Python 源码中强制规定：所有新注入的低秩矩阵变量名，必须被强行拼接上 lora_ 前缀。
-            # 例如，原模型中一个被冻结的线性层权重名字是： model.layers.0.self_attn.q_proj.weight
-            # PEFT 在它旁边挂载的两个可训练小矩阵的名字会被自动注册为： model.layers.0.self_attn.q_proj.lora_A.default.weight model.layers.0.self_attn.q_proj.lora_B.default.weight
-            # 代码的物理执行逻辑 if "lora_" in name: 这一行代码在物理上就是一个高精度的字符串过滤器。 它遍历模型中成千上万个张量门牌号，一旦发现字符串中包含 lora_，就立刻对该张量执行 param.requires_grad = True。这确保了只打开新增旁路矩阵的计算图闸门，而不会误触基座模型原有的百亿级冻结参数。
             for name, param in self.vlm.language_model.base_model.lora_model.named_parameters():
                 if "lora_" in name:
                     param.requires_grad = True
-
-
-
-
-
-
         self.stage = stage
-
 
         self.vlm.language_model.print_trainable_parameters()
 
-
         self.vlm.language_model.transformer_layer_cls = Qwen2DecoderLayer
 
-
-        #把所有参数和涉及到更新的梯度都转换成float32格式，降低数值计算错误风险（尤其是在使用混合精度训练时）。这是一种极限保守的数值稳定性措施，确保在训练过程中不会因为某些梯度过小而被 bfloat16 的表示范围截断，从而导致训练崩溃或性能退化。
         for name, param in self.named_parameters():
             param.data = param.data.to(torch.float32)
             if param.grad is not None:
                 param.grad.data = param.grad.data.to(torch.float32)
 
-
-
-
-
-
-
-
-        # 一、 这种写法是为了什么？（物理目的）
-        # 1. 强行适配 Hugging Face 的底层 API 在 InstructVLA 的推理（预测）阶段，模型会调用语言模型生成文本。Hugging Face 的 generate() 函数有一个硬性规定：如果你想自定义“什么时候停止生成”，你必须传入一个继承自 StoppingCriteria 的对象。 这段代码的物理逻辑是：每次生成一个新 Token 时，检查它解码后的字符串是不是等于预设的停止词（在这里是 <new_token_0>）。如果是，返回 True 强行掐断生成流。
-        # 2. 一次性工具。作者将它写在 __init__ 函数里面，这意味着 StoppingCriteriaSub 这个类只在执行 __init__ 的那一瞬间于内存中存在。一旦初始化完成，外部代码（甚至 InstructVLA 的其他方法）绝对无法通过 InstructVLA.StoppingCriteriaSub 找到或调用这个类。作者认为这是一个极其专用的“一次性工具”，没必要暴露给全局命名空间（Global Namespace）。
-        # 二、 这种写法很常见吗？
-        # 客观结论：在工程级（Production）代码中极其罕见，但在深度学习的“研究型代码（Research Code）”中非常常见。
-        # 为什么说它是典型的“研究型代码”特征？
-        # 图省事 / 编码惯性：研究人员在写代码时，写到 __init__ 发现需要给 self.stopping_criteria 赋值，但发现 Hugging Face 强制要求传一个类实例。为了不打断当前的编码心流（不用往上翻几百行去文件顶部定义新类），直接在原地顺手定义了一个。
-        # 物理层面的工程瑕疵：
-        # 内存冗余操作：在 Python 中，def 和 class 都是可执行语句。这意味着每一次你实例化 InstructVLA（比如 model = InstructVLA(...)），Python 解释器都会在内存中重新编译、分配并定义一次 StoppingCriteriaSub 这个类。虽然 VLA 模型通常只实例化一次，这种性能损耗可以忽略不计，但这在软件工程上属于冗余指令。
-        # 无法被序列化（Pickle）：定义在函数内部的类属于局部对象，Python 的底层序列化模块（如 pickle 或 torch.save 某些情况）无法准确定位并保存局部类。这可能导致在某些分布式通信或特定格式存档时触发报错。
 
         class StoppingCriteriaSub(StoppingCriteria):
             def __init__(self,tokenizer, stops = [], encounters=1):
@@ -415,24 +242,12 @@ class InstructVLA(nn.Module):
         self.run_index = 0
         self.latent = None
     
-
-
     @property
     def fix_system1(self):
-        # 1. 当执行 model.fix_system1 = True 时：
-        # 系统行为：代码自动遍历动作分支里的所有参数，并将其标记为“不可训练”。
-        # 最终结果：动作分支被彻底冻结。在随后的训练计算中，即使产生了误差，动作分支的底层权重数据也绝对不会发生任何数值上的改变。
-        # 2. 当执行 model.fix_system1 = False 时：
-        # 系统行为：代码自动遍历动作分支里的所有参数，并将其标记为“可训练”。
-        # 最终结果：动作分支被解冻。在随后的训练计算中，动作分支的权重数据会根据误差正常进行数学更新。
-        # 3. 为什么需要这段代码？
-        # 纯粹为了工程便利。在极其复杂的模型微调中，研究员经常需要在“训练语言”和“训练动作”之间来回切换。这段代码将内部极其繁琐的 for 循环批量操作，打包成了一个极其简单的 True 或 False 赋值指令。调用者只需输入一行极简代码，就能一键完成成千上万个参数的批量冻结或解冻。
-
         return self._fix_system1
 
     @fix_system1.setter
     def fix_system1(self, value: bool):
-        """动态切换动作分支参数的 requires_grad。"""
         overwatch.warning(f"fix_system1 is being updated to: {value}")
         if value:
             for name, param in self.action_model.named_parameters():
@@ -445,58 +260,23 @@ class InstructVLA(nn.Module):
 
     @property
     def llm_backbone(self):
-        """返回语言骨干，供 FSDP 包装策略读取。"""
         return self.vlm.language_model
     
     @property
     def vision_backbone(self):
-        """返回视觉骨干，供 FSDP 包装策略读取。"""
         return self.vlm.vision_model
     
     def freeze_backbones(self, stage):
-        """透传到底层 VLM 的冻结逻辑。"""
         self.vlm.freeze_backbones(stage)
     
-
-#chat方法是多模态模型里高度封装抽象的内容，输入语言输出语言，中间的ids高维向量都拿不到（相当于一个端到端黑盒，一般不用于开发，只用于测试是否有chat能力）
-
-# .chat() 和 .generate() 的核心物理区别在于抽象封装层级（Abstraction Level）。在代码的执行拓扑图中，.chat() 是 .generate() 的上层封装。
-# 以下是两者在物理机制与工程调用上的精确剥离对比：
-# 一、 核心物理职能定义
-# .generate()（底层核心算子） 这是存在于 Hugging Face GenerationMixin 中的底层函数。它不识别任何人类语言（汉字、英文字母）。它的唯一物理输入是高维离散整数张量（Token IDs）。它在显存中维持一个死循环，不断调用矩阵乘法（forward），根据当前的整数序列计算出下一个最高概率的整数，并最终返回一串整数。
-# .chat()（高级应用封装） 这是存在于特定模型类（如 Qwen/LLaVA 等）外围的端到端（End-to-End）接口。它的物理输入是人类可读的字符串（String）。它在内部隐藏了数据结构的转换过程，其目的是让非算法工程师也能像调用 API 一样与模型对话。
-# 二、 物理流转链路示例
-# 假设人类用户向模型输入了一句 “苹果熟了吗？”。以下是两种方法在底层代码中的真实执行链路差异：
-# 1. 强制使用 .generate() 执行的底层流水线
-# 系统必须分 4 个物理步骤手动处理矩阵与字符串的转换：
-#   模板注入（Apply Chat Template）：研究员必须手动编写代码，将人类语言包裹进该模型特有的对话结构中。
-#       内存形态：text = "<|im_start|>user\n苹果熟了吗？<|im_end|>\n<|im_start|>assistant\n"
-#   词元化映射（Tokenization）：调用底层的 Tokenizer，将这段预处理字符串映射为字典索引。
-#       显存形态：input_ids = tensor([[1512, 872, 334, 1899, 15, 663, ...]])
-#   核心自回归计算：执行 model.generate(input_ids)。经过计算图的多次循环，显存输出包含答案的新整数序列。
-#       显存形态：output_ids = tensor([[1512, ..., 455, 122, 998, 2]])
-#   去词元化解码（Detokenization）：调用解码器，将新生成的数字逆向翻译回字符串。
-#       输出形态："熟了。"
-# 2. 使用 .chat() 执行的高级流水线
-# 调用者只需向内存传入一条极简指令：
-# 执行：model.chat([{"role": "user", "content": "苹果熟了吗？"}])
-# 物理隐蔽：在执行这一行代码时，系统在底层的黑盒中，自动化、隐式地依次执行了上述 .generate() 链路中的第 1、2、3、4 步。最终直接返回人类字符串 "熟了。"。
-
     @torch.inference_mode()
     def chat(self, *args, **kwargs):
-        # autocast_dtype：这只是一个变量名
-        # with torch.autocast("cuda", dtype=autocast_dtype, enabled=True): 这行代码的意思是：“在这个代码块内部，所有支持自动混合精度的操作都将自动使用 bfloat16 来进行计算，以提高效率和减少显存占用。”
-        # torch.autocast 是 PyTorch 提供的一个上下文管理器，用于自动混合精度训练和推理。通过指定 dtype 参数，用户可以选择在该上下文中使用哪种数据类型进行计算。在这个例子中，选择了 bfloat16
+        # chat method from eagle vlm
+        autocast_dtype = torch.bfloat16
         with torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
             ret = self.vlm.chat(*args, **kwargs)
         return ret
 
-
-
-
-
-    #前向传播是为了算loss的，所以要用if语句根据当前样本里有没有actions标签来决定是算语言损失还是算语言损失+动作损失。
-    #记住前向传播算loss
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -505,7 +285,7 @@ class InstructVLA(nn.Module):
         system1_pixel_values: Optional[torch.FloatTensor] = None,
         labels: Optional[torch.LongTensor] = None,
         actions: Optional[torch.FloatTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,#Optional[bool] 等价于 bool | None（或 Union[bool, None]）。含义：它明确告诉调用者，这个参数既可以传入布尔值，也可以传入 None。
+        inputs_embeds: Optional[torch.FloatTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -519,13 +299,9 @@ class InstructVLA(nn.Module):
         train_idx = 0,
         **kwargs,
     ) -> Tuple:
-        """训练前向。
-
-        - actions is None: 仅计算语言损失
-        - actions is not None: 计算语言损失 + 动作损失
-        """
-        if actions is None:#这里的acitons的意思是未来动作窗口（含当前步）的监督信号，如果没有传入，就说明当前训练样本不包含动作标签，那么就只能计算语言损失了。
-            # 纯语言路径。
+        if actions is None:
+            # standard vlm forward
+            # from IPython import embed;embed()
             per_device_batch_size = input_ids.shape[0]
             output: CausalLMOutputWithPast = self.vlm(
                 input_ids=input_ids,
@@ -546,7 +322,6 @@ class InstructVLA(nn.Module):
 
             assert per_device_batch_size == actions.shape[0]
 
-            # 先跑语言模型，提取最后层隐藏状态。
             output: CausalLMOutputWithPast = self.vlm(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -562,57 +337,25 @@ class InstructVLA(nn.Module):
                 fast_loss_cal=True
             )
 
-
-            # 提取最后一层 hidden states。
+            # extract the last hidden state
             last_hidden_states = output.hidden_states[-1]
             
-            
+            # extract the latent action
             meta_feature_mask = (input_ids >= self.min_meta_token) & (input_ids <= self.max_meta_token)
-            #input_ids是 [B, S]， last_hidden_states是 [B, S, D]， 通过meta token的mask选出对应的hidden state，得到 [B, N_meta, D]
-            # meta_feature_mask.size(0)：保持原始的 Batch Size（批大小）。
-            # -1：这是一个自动计算占位符。PyTorch 会根据总元素量自动推算出每条数据中有多少个 Meta Token。
-            # last_hidden_states.shape[-1]：保持原始的 Hidden Size（向量维度，如 768 或 1024）
-
             meta_feature = last_hidden_states[torch.where(meta_feature_mask==1)].view(meta_feature_mask.size(0),-1 , last_hidden_states.shape[-1])
-            #被 where 过滤后的结果往往会变成一串“扁平”的一维序列，失去了原有的空间结构。必须用view把它重新“捏”回正确的形状
-            #这样就从hidden states里抽取除了需要更新的那部分
 
-
-            # 只监督未来动作窗口（含当前步）。
-            # actions[:, -(self.future_action_window_size+1):, :]
-            # 第一个 : (针对第 0 维 Batch)
-            #   操作：全量提取。保留所有 16 条数据，不丢弃任何一个批次样本。
-            # 中间的 -(self.future_action_window_size+1): (针对第 1 维 Time)
-            #   操作：利用 Python 的负索引机制进行“时间轴尾部截取”。
-            #   数学计算：假设系统设定预测未来动作窗口 self.future_action_window_size = 15。则计算结果为 -16:。
-            #   物理效果：在 Sequence_Length 这 50 个历史时间帧中，系统直接舍弃前 34 个时间帧的数据，仅提取最后 16 个时间帧（即当前步加上未来的 15 步）构成的轨迹段。
-            # 第三个 : (针对第 2 维 Action_Dim)
-            #   操作：全量提取。保留机械臂所有 7 个维度的坐标数值。
-            # 
-            # 经过该切片操作，原始形状为 [16, 50, 7] 的张量，在内存中被物理裁剪为 [16, 16, 7] 的新张量 actions_future。
-
+            # actions_history = actions[:,0:self.past_action_window_size,:]
             actions_future = actions[:, -(self.future_action_window_size+1):, :]
             _, _, action_dim = actions_future.shape
             
-            # 动作分支输出 flow-matching loss。
             loss = self.action_model( latent_action = meta_feature,
                         pixel_values = dict(dino = system1_pixel_values),
                         actions = actions_future,
                         t = t,
                     )
 
-            # 总损失 = 动作损失 + 语言损失。
             return loss + output.loss, output.loss
 
-
-
-
-
-
-    # 工程背景：由于大模型（如 InstructVLA）的参数量达到百亿级别，单张 GPU 的显存物理空间绝对无法装载全量矩阵张量。必须使用 PyTorch 的 FSDP（Fully Sharded Data Parallel，完全分片数据并行）框架将模型拆分到多张显卡上。
-    #  功能实质：这段代码直接向 FSDP 框架下达了强制的切分边界指令。它精确指定了视觉网络（SiglipEncoderLayer）、语言网络（Qwen2DecoderLayer, LlamaDecoderLayer）以及中间映射层（LinearProjector 等）的类名称。
-    #  最终结果：FSDP 框架在读取此函数返回的策略后，会严格按照这些指定的网络层级作为物理边界，将巨大的参数矩阵整齐地切割并分布到不同的物理显卡显存中。这确保了在进行跨显卡矩阵乘法和梯度同步时，底层的计算图不会因为随意切分而发生内存碎片化或通讯死锁。
-    # · 
     def get_fsdp_wrapping_policy(self) -> Callable:
         """Return an FSDP _or_policy over the policies returned by each individual backbone (and our VLM policy)."""
 
@@ -643,17 +386,6 @@ class InstructVLA(nn.Module):
             ],
         )
 
-
-
-
-
-
-
-
-#这个函数专门用来加载预训练权重并且实例化instructVLA，它的步骤和InstructVLA的构造函数呼应上了，先加载大语言模型eagle2的本体、processor和tokenizer，并且扩展词表，加入meta tokens
-#构造函数里有负责设置lora config，以及实例化action head的操作
-#然后冻结该冻结的，解冻该解冻的，并且完成instructVLA的实例化，这样就完成了拼接vlm和action head，并且加载了权重（如果ckpt里有lora，则language model部分先实例化instructVLA再加载权重
-# ，如果没有lora，那先加载即可，vision model和mlp1无所谓在实例化前后，因为lora只挂在了language model里）
     @classmethod
     def from_pretrained(
         cls,
@@ -667,16 +399,14 @@ class InstructVLA(nn.Module):
         num_of_meta_query = 64,
         **kwargs,
     ) -> InstructVLA:
-        """从 checkpoint 构建 InstructVLA（含 tokenizer 扩展与权重恢复）。"""
 
         llm_backbone_id = os.path.abspath(
                 os.path.join(os.path.dirname(__file__), "..", "ckpt", "Eagle2-2B")
             )
 
-        # 加载基础 VLM 骨干。
+        # Load VLM backbone, borrowed from PrismaticVLM
         vlm = AutoModel.from_pretrained(llm_backbone_id,
-                                        # attn_implementation="flash_attention_2",
-                                        attn_implementation="eager",
+                                        attn_implementation="flash_attention_2",
                                         trust_remote_code=True)
 
         processor = EagleProcessor(
@@ -692,20 +422,19 @@ class InstructVLA(nn.Module):
                                                   use_fast=True,
                                                   trust_remote_code=True)
 
-        # 在实例化InstructVLA之前，先把token词表和对应的embedding扩展
-        new_tokens = ['<new_token_{}>'.format(i) for i in range(num_of_meta_query)]
+        new_tokens = ['<new_token_{}>'.format(i) for i in range(num_of_meta_query)]  # Create 256 new token names
         overwatch.info(f"add {len(new_tokens)} latent action tokens")
         tokenizer.add_tokens(new_tokens)  # Add them to the tokenizer
         tokenizer.new_tokens = new_tokens
         processor.tokenizer = tokenizer
 
-        # 扩展 embedding 尺寸以匹配新词表。
+        # Resize the model's token embeddings to match the new vocabulary size
         try:  # Skip mean resize feature in new version of transformers
             vlm.language_model.resize_token_embeddings(len(tokenizer), mean_resizing = False)
-        except Exception as e:    #except: 这是一个关键字，意思是“如果 try 块里的代码报错了，就执行我这里的逻辑”。
+        except Exception as e:
             vlm.language_model.resize_token_embeddings(len(tokenizer))
 
-        # 在这里先冻结全部参数，后续由 stage 策略控制可训练子模块。（这样实例化的时候就保证了vlm是全部冻结的）
+        # Freeze all parameters in the model
         for param in vlm.parameters():
             param.requires_grad = False
 
@@ -716,72 +445,11 @@ class InstructVLA(nn.Module):
         assert vlm.template == processor.model_spec.template
         assert vlm.num_image_token == processor.model_spec.num_image_token
 
-
-
-        # 问：
-        # bitfit_biases = torch.load('medical_biases.pth')
-        # model.load_state_dict(bitfit_biases, strict=False)
-        # 这两句我不理解，为什么torch.load以后还要再load_state_dict？是torch的加载方法返回的是什么对象？
-        # 答:
-        # torch.load('medical_biases.pth')：从硬盘读到内存
-        # torch.load() 只做一件事：把文件里的二进制数据反序列化，变成一个Python对象。它不关心这个对象是什么。
-        #     返回值：一个Python对象，具体是什么取决于你当初用 torch.save() 保存了什么。
-        #     在你老师的例子中，当初保存的是 bitfit_biases.state_dict()，所以现在 torch.load() 返回的就是那个 state_dict 字典。
-        # 到这一步为止，这些参数还只是内存中的一个字典，跟你的模型没有任何关系。
-        # model.load_state_dict(bitfit_biases)：从内存应用到模型
-        # load_state_dict() 是模型的方法，它的作用是：用字典里的值去更新模型自己的参数。
-        # 这一步才是真正的 “加载”，它建立了参数数据和模型结构之间的联系。
-
-#         当你看到 torch.load(...).["model"] 时，说明当初开发者是用类似下面的逻辑进行保存的：
-        # # 开发者保存时的代码：
-        # checkpoint = {
-        #     "model": model.state_dict(),        # 模型权重（这是你最关心的）
-        #     "optimizer": optimizer.state_dict(), # 优化器的状态（比如学习率跑到哪了）
-        #     "epoch": 10,                        # 训练到第几轮了
-        #     "loss": 0.01,                       # 当时的损失函数值
-        #     "args": args,                       # 当时的各种配置参数
-        # }
-        # torch.save(checkpoint, "checkpoint.pt")
         model_state_dict = torch.load(pretrained_checkpoint, map_location="cpu")["model"]
-        # 1. 物理形态：model_state_dict['language_model'] 长什么样？
-        # 在 PyTorch 中，state_dict 本质上是一个 Python 字典 (OrderedDict)。
-        #     它的“键”（Keys）：是模型每一层权重的名字（字符串）。
-        #     它的“值”（Values）：是对应那一层权重的张量数字（Tensor）。
-        # 当你看到 any('lora' in i for i in ...) 时，代码其实只关心字典里的键（名字）。
-        # 如果它是一个普通的模型（没有 LoRA）：
-
-        # 它的键名看起来非常标准，直接指向矩阵：
-
-        # {
-        #     'model.layers.0.self_attn.q_proj.weight': tensor([...]),
-        #     'model.layers.0.self_attn.k_proj.weight': tensor([...]),
-        #     'model.embed_tokens.weight': tensor([...]),
-        #     ...
-        # }
-
-        # 如果它是一个 LoRA 模型：
-
-        # PEFT 库（用于实现 LoRA 的工具）在注入权重时，会修改权重的名字，强行插入 lora_A 或 lora_B 这样的标识符：
-
-        # {
-        #     'model.layers.0.self_attn.q_proj.base_layer.weight': tensor([...]), # 原始权重
-        #     'model.layers.0.self_attn.q_proj.lora_A.default.weight': tensor([...]), # LoRA 旁路 A
-        #     'model.layers.0.self_attn.q_proj.lora_B.default.weight': tensor([...]), # LoRA 旁路 B
-        #     'model.layers.1.self_attn.v_proj.lora_A.default.weight': tensor([...]),
-        #     ...
-        # }
-
-
-
-# 这段逻辑的物理目的是防止张量拓扑结构不匹配导致的显存崩溃（KeyError）：状态一：合并过 LoRA 的 Backbone (Merged Model) -> 判定为 False；状态二：纯净的原始 Backbone (Raw Base Model) -> 判定为 False；状态三：包含未合并 LoRA 的状态字典 (Unmerged LoRA) -> 判定为 True
-#     如果检查到是状态一或状态二（无独立 LoRA 张量，即 False），说明当前读取的是一个标准架构的语言模型。系统可以直接安全地调用 .load_state_dict() 将基础权重灌入尚未被修改的 vlm.language_model 中。随后，下一行的 InstructVLA(...) 初始化函数才会在这个已有权重的骨干网络上，通过外挂 PEFT 框架强行注入初始化的 LoRA 旁路。
-#     如果检查到是状态三（包含未合并的 LoRA 张量，即 True），系统必须跳过直接加载。因为此时的 vlm.language_model 在内存中仍是标准架构，没有分配给 lora_A 和 lora_B 的张量接收坑位。直接加载会引发找不到参数键值的严重异常。必须将这个带有 LoRA 的字典交由后续的 InstructVLA(...) 或专门的 PEFT 加载器，在修改完网络拓扑图之后再行加载
         is_a_lora_model = any('lora' in i for i in  model_state_dict['language_model'])
         if not is_a_lora_model:
             overwatch.warning("No LoRA parameters in the checkpoint, so we load weight before init LoRA")
             vlm.language_model.load_state_dict(model_state_dict["language_model"])
-            #这里的意思就是，如果他ckpt里不是lora，那就可以直接挂在到语言模型上，因为结构完全匹配；如果他ckpt里是lora，
-            # 那就说明语言模型的结构已经被改了，不能直接加载，要等到后面InstructVLA初始化完再加载。Instructvla初始化函数里是有调用peft的
 
         # Initialize InstructVLA
         instruct_vla = InstructVLA(vlm,
@@ -792,7 +460,7 @@ class InstructVLA(nn.Module):
                         future_action_window_size = future_action_window_size,
                         past_action_window_size = past_action_window_size,
                         norm_stats = norm_stats,
-                        meta_token_ids = new_token_ids,#传入这个参数，然后构造函数里会利用它把实例化以后的Instructvla里该解冻的部分解冻
+                        meta_token_ids = new_token_ids,
                         stage = stage,
                         )
 
@@ -809,19 +477,12 @@ class InstructVLA(nn.Module):
             instruct_vla.vlm.language_model.load_state_dict(model_state_dict["language_model"])
         
 
-        # 尝试恢复动作分支权重。
+        # Load ActionModel from Checkpoint
         if "action_model" in model_state_dict:
             instruct_vla.action_model.load_state_dict(model_state_dict["action_model"], strict=False)
         else:
             overwatch.warning("No Action Model found in the pretrained checkpoint. Initializing a new one.")
         return instruct_vla       
-
-
-
-
-
-
-
 
     @torch.inference_mode()
     def predict_action(
@@ -831,46 +492,31 @@ class InstructVLA(nn.Module):
         unnorm_key: Optional[str] = None, 
         use_generate = False,
         cache_latent = False,
-        prompt_mode = "image_text_primary",# "image_text_primary"or "default"
         **kwargs: str
-    ) -> Tuple[np.ndarray, np.ndarray, torch.Tensor]:
+    ) -> np.ndarray:
+        """
+        Core function for VLA inference; maps input image and task instruction to continuous action.
 
-        # 统一使用 BF16 autocast 以兼顾吞吐与显存占用。
+        @param image: PIL Image as [height, width, 3]
+        @param instruction: Task instruction string
+        @param unnorm_key: Optional dataset name for retrieving un-normalizing statistics; if None, checks that model
+                           was trained only on a single dataset, and retrieves those statistics.
+
+        @return Unnormalized (continuous) action vector --> end-effector deltas.
+        """
+        # Build VLA Prompt
     
-        if prompt_mode == "default":
-            user_prompt = f"What action should the robot take to {instruction}?"
-            user_prompt_reason = f"What action should the robot take to {instruction}? First answer my question."
-        elif prompt_mode == "image_text_primary":
-            user_prompt = (
-                "Use the command written in the image as the primary instruction. "
-                "Read the text in the image, ground it to the scene, and execute it."
-            )
-            user_prompt_reason = (
-                "Use the command written in the image as the primary instruction. "
-                "Read the text in the image, briefly explain what the robot should do, "
-                "then execute it."
-            )
-        else:
-            raise ValueError(f"Unknown prompt_mode: {prompt_mode}")
-        
-
-
         autocast_dtype = torch.bfloat16
-        # 在 stage2/use_generate 路径中可能提前由 prepare_input 直接给出像素张量。
         pixel_values = None
 
-
-        # stage2 可选先做一轮语言 reasoning，再补全动作 token。
-        # 该路径的目标是把短文本推理结果作为动作预测的语言条件之一。
+        # Prepare Inputs
         if use_generate and self.stage=="stage2":
-            # 每 20 步（或首次）刷新一次 reasoning，减少重复生成开销。
             if self.last_response is None or self.run_index % 20 == 0:
                 prompt = [
                     {"role": "system", "content": DEFAULT_SYSTEM_MESSAGE},
                     {
                         "role": "user",
-                        # "content": f"What action should the robot take to {instruction}? First answer my question.",
-                        "content": user_prompt_reason,
+                        "content": f"What action should the robot take to {instruction}? First answer my question.",
                         "image": [{'np_array': np.asarray(image)}],
                     },
                     {
@@ -878,7 +524,6 @@ class InstructVLA(nn.Module):
                         "content": ""
                     }
                 ]
-                # prepare_input: 推理态输入打包，不构建 labels。
                 inputs = self.processor.prepare_input({"prompt": prompt})
                 input_ids = inputs['input_ids'].to(self.vlm.device)
                 pixel_values = inputs['pixel_values']
@@ -886,7 +531,6 @@ class InstructVLA(nn.Module):
                 pixel_values = pixel_values.to(self.vlm.device, dtype=autocast_dtype)
                 
                 with torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
-                    # 注意：这里使用 -10 作为占位 padding 的屏蔽条件（与本项目 tokenizer 流程一致）。
                     attention_mask = input_ids.ne(-10)
                     output: CausalLMOutputWithPast = self.vlm.generate(
                         input_ids=input_ids,
@@ -896,24 +540,21 @@ class InstructVLA(nn.Module):
                         # fast_loss_cal=False,
                         output_hidden_states=False,
                         return_dict_in_generate=False,
-                        # 命中停止词后提前结束，避免无效长输出。
-                        stopping_criteria=self.stopping_criteria
+                        stopping_criteria=self.stopping_criteria # to accelerate primitive
                     )
 
-                # 记录 reasoning 文本，供后续 prompt 复用。
+                # Extract cognition feature
                 response = self.tokenizer.decode(output[0]).replace("<new_token_0>","")
                 print("====== Reasoning ======= >" + response)
                 self.last_response = response
             else:
-                # 复用最近一次 reasoning，减少生成成本。
                 response = self.last_response
 
             prompt = [
                 {"role": "system", "content": DEFAULT_SYSTEM_MESSAGE},
                 {
                     "role": "user",
-                    # "content": f"What action should the robot take to {instruction}? First answer my question.",
-                    "content": user_prompt_reason,
+                    "content": f"What action should the robot take to {instruction}? First answer my question.",
                     "image": [{'np_array': np.asarray(image)}],
                 },
                 {
@@ -922,13 +563,11 @@ class InstructVLA(nn.Module):
                 }
             ]
         else:
-            # 非 reasoning 路径：直接使用“指令 + meta token”模板做动作条件构建。
             prompt = [
                 {"role": "system", "content": DEFAULT_SYSTEM_MESSAGE},
                 {
                     "role": "user",
-                    # "content": f"What action should the robot take to {instruction}?",
-                    "content": user_prompt,
+                    "content": f"What action should the robot take to {instruction}?",
                     "image": [{'np_array': np.asarray(image)}],
                 },
                 {
@@ -936,18 +575,14 @@ class InstructVLA(nn.Module):
                     "content": "".join(self.processor.tokenizer.new_tokens)
                 }
             ]
-
-        # 训练态同款预处理：构建 input_ids 与 pixel_values（同时可得到 labels，但此处不使用 labels）。
         inputs = self.processor.preprocess_inputs_and_labels({"prompt": prompt})
-        # 扩展 batch 维度 -> [1, L]
         input_ids = inputs['input_ids'].to(self.vlm.device).unsqueeze(0)
         if pixel_values is None:
-            # 若未在 reasoning 分支中提前准备像素张量，这里从 preprocess 结果读取。
+            # Preprocess Image
             pixel_values = inputs['pixel_values']
             pixel_values = pixel_values.to(self.vlm.device, dtype=autocast_dtype)
 
-        # 通过 VLM 前向提取认知特征（可选缓存 latent）。
-        # 复用条件: cache_latent=True 且当前为奇数步且已有缓存。
+        # Generate cognition feature through vlm
         if cache_latent is False or (cache_latent is True and (self.run_index % 2 == 0 or self.latent is None)):
             with torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
                 attention_mask = input_ids.ne(-10)
@@ -962,63 +597,41 @@ class InstructVLA(nn.Module):
                     output_hidden_states=True,
                 )
 
-            # 保存最后一层 hidden states，供当前/后续步抽取 meta token 表示。
+            # Extract cognition feature
             last_hidden_states = output.hidden_states[-1]
-            #.detach() 断开计算图，避免梯度回传；赋值给 self.latent 以供后续复用。代码逻辑中有一个 cache_latent 开关。它的意思是：我算一次 VLM 特征，然后接下来的 2 步动作推理都复用这个特征。
-            # 物理逻辑：当你复用旧特征时，这些特征已经是“过去式”了。你不需要（也无法）让当前的误差跨越时间流回到上一轮的计算图中。
             self.latent = last_hidden_states.detach()
         else:
-            # 命中复用策略时直接使用缓存，跳过 VLM 前向。
             last_hidden_states = self.latent
             
-        # 取出 meta token 对应隐变量。
         meta_feature_mask = (input_ids >= self.min_meta_token) & (input_ids <= self.max_meta_token)
         meta_feature = last_hidden_states[torch.where(meta_feature_mask==1)].view(meta_feature_mask.size(0),-1 , last_hidden_states.shape[-1])
 
-        # 仅用于调试形状，当前函数未显式使用。
         BS, step, dim = meta_feature.shape
 
-        # system1 动作分支使用 DINO 预处理；保持与动作头训练输入一致。
         sys1_pixel_values = dict(dino = self.action_model.default_dino_transform(image).unsqueeze(0).to(self.vlm.device))
-        # 动作分支采样得到归一化动作。
         with torch.autocast("cuda", dtype=autocast_dtype, enabled=True):
             samples = self.action_model.sampling(   latent_action = meta_feature,
                                                     pixel_values = sys1_pixel_values,
                                                     )
-        # samples[0]: 去掉 batch 维度，转为 numpy 便于后续后处理。
         normalized_actions = samples[0].float().cpu().numpy()
 
-        # 按数据集统计量反归一化，得到可执行动作范围。
+        # Un-normalize Actions        
         action_norm_stats = self.get_action_stats(unnorm_key)
-        # mask=False 的维度保持归一化值；mask=True 的维度执行线性反归一化。
         mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
         action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
-        # 归一化动作裁剪到 [-1, 1]，避免异常值放大。
         normalized_actions = np.clip(normalized_actions, -1, 1)
-        # 夹爪维（索引 6）做二值化，强化开合决策稳定性。
         normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.5, 0, 1) 
         actions = np.where(
             mask,
             0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
             normalized_actions,
         )
-
-        # 推理步计数器更新，影响 reasoning 刷新与 latent 复用策略。
         self.run_index += 1
-
-        # 清理 X-LoRA 累积 hook，避免长时推理退化。
         cleanup_xlora_pre_hooks(self.vlm.language_model)
-
-        # 返回三元组：反归一化动作、归一化动作、认知特征。
         return actions, normalized_actions, meta_feature
-
-
-
-
 
     @staticmethod
     def _check_unnorm_key(norm_stats, unnorm_key):
-        """校验 unnorm_key 是否存在于 norm_stats。"""
         if unnorm_key is None:
             assert len(norm_stats) == 1, (
                 f"Your model was trained on more than one dataset, "
@@ -1034,12 +647,12 @@ class InstructVLA(nn.Module):
         return unnorm_key
 
     def get_action_dim(self, unnorm_key=None):
-        """返回动作空间维度。"""
+        """Dimensionality of the policy's action space."""
         unnorm_key = self._check_unnorm_key(self.norm_stats, unnorm_key)
         return len(self.norm_stats[unnorm_key]["action"]["q01"])
 
     def get_action_stats(self, unnorm_key=None):
-        """返回动作反归一化统计量。"""
+        """Dimensionality of the policy's action space."""
         unnorm_key = self._check_unnorm_key(self.norm_stats, unnorm_key)
         return self.norm_stats[unnorm_key]["action"]
 
@@ -1057,33 +670,6 @@ from transformers import AutoTokenizer, AutoProcessor
 from huggingface_hub import HfFileSystem, hf_hub_download
 import os
 import json
-
-
-
-
-# 简单来说，RLDSBatchTransform 的核心任务只有一件事：把硬盘里“给人类看”的原始数据，翻译成显卡里“模型能计算”的数学张量。
-# 为了理解它的必要性，我们需要看清数据在流转过程中的状态坍缩：
-# 1. 它的输入是什么？（硬盘里的原始素材）
-# 当你从硬盘读取一组机器人数据（RLDS 格式）时，它是一个杂乱的字典，包含：
-# 图像：原始的 RGB 像素阵列。
-# 文本：一串 UTF-8 编码的字节流（例如 b'pick up the apple'）。
-# 动作：一堆原始的机械臂电机读数（例如 [0.124, -0.05, ...]）。
-# 推理标注：一段 JSON 格式的字符串，记录了人类专家对这一步动作的解释。
-
-# 2. 它的物理职能（它是怎么“翻译”的？）
-# 模型（VLM）是不能直接读取上述原始素材的，RLDSBatchTransform 在内存中强行执行了以下三项转换手术：
-# 维度统一（Vision Transform）： 将不同尺寸的图片统一裁剪、缩放，并转化为 [0, 1] 之间的浮点数张量。如果没有这一步，显卡会因为输入矩阵形状不一致而直接报错。
-# 词元化（Language Tokenization）： 调用 processor，将人类指令字符串切碎成一个个整数 ID（Token IDs）。它还负责把“问题”和“答案”拼接在一起，形成一个完整的对话链条。
-# 标签掩码（Label Masking）： 这是最关键的一步。它在生成 labels 时，会把“问题”部分的 ID 全部改为 -100。 物理后果：这告诉显卡，计算误差（Loss）时只看“机器人输出的回答和动作”，闭眼无视“人类输入的指令”。
-
-# 3. 它的输出是什么？（显卡能吃的“压缩饼干”）
-# 经过 __call__ 函数处理后，那个乱七八糟的硬盘字典消失了，取而代之的是一个整齐的 Tensor 字典。里面只有四个核心矩阵：
-# input_ids：一串代表文字的数字。
-# pixel_values：代表图像的一堆浮点数。
-# labels：代表“标准答案”的数字。
-# actions：代表“机械臂应该达到的坐标”的数字。
-# 总结
-# 你可以把 RLDSBatchTransform 想象成一个“加工流水线”。 它的上游是堆满原材料（原始视频、文本、坐标）的仓库，它的下游是正在等待计算的显卡。它的存在，是为了保证送进显卡的数据是格式绝对标准、维度绝对整齐、且带好了Loss计算标记的合格产品。
 
 @dataclass
 class RLDSBatchTransform:
@@ -1110,12 +696,7 @@ class RLDSBatchTransform:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
         # dataset_name, action = rlds_batch["dataset_name"], rlds_batch["action"][0]
         
-
-
-
-        # 物理动作：从当前批次字典中提取核心原料：当前帧图像 (img)、人类语言指令 (lang)、以及极其关键的人工标注推理信息 (anno)。
-        # 数据结构：anno 里包含了研究人员提前写好的“机器人在执行动作前应该思考的内容”（例如场景描述 Caption，视觉问答 QA，以及运动基元 move_primitive）。
-
+        # For future action predictions
         if rlds_batch["action"].shape[0] > 1:
             dataset_name, action = rlds_batch["dataset_name"], rlds_batch["action"]
         else:
@@ -1134,23 +715,10 @@ class RLDSBatchTransform:
         anno = json.loads(rlds_batch["reasonings"].decode())
         move_primitive = anno["move_primitive"]
 
-
-
-
-
-
-
         # begin =============== prepare inputs for VLM ===================
-        # 这段复杂的 if-elif 树，在物理层面生成了千变万化的文本结构。在经过这里后，所有的文本数据最终都会变成标准的 Hugging Face [{"role": "user", ...}, {"role": "assistant", ...}] 对话字典列表
-        
-        
-        
         last_image = [{'np_array': img[-1]}] # always use the last(current) image for VLM
 
-        # 在 Stage 1 中，系统的目标是让动作头（Action Head）快速学会输出坐标。所以 Prompt 极度精简，Assistant 的回答直接就是那 64 个承载坐标信息的 <new_token_x>
         if self.stage == 'stage1' or self.disable_instruction:
-            # 20% 概率加上 move_primitive (运动基元，例如 "move forward")
-            # 80% 概率直接要求输出动作
             if random.random() < 0.2 and move_primitive is not None:
                 action_prompt = f"What action should the robot take to {lang}? Give both move primitive and action."
                 assistant_content = f"{move_primitive} " + "".join(self.processor.tokenizer.new_tokens)
@@ -1171,8 +739,7 @@ class RLDSBatchTransform:
                 }
             ]
         elif self.stage == 'stage2':
-            
-            #生成了两个随机数 instruction_prob 和 primitive_prob，将数据流强行切分为多条概率分支
+
             instruction_prob = random.random()
             primitive_prob = random.random()
 
@@ -1186,34 +753,10 @@ class RLDSBatchTransform:
                 if  "CC" in anno['alt_instruction'] and len(anno['alt_instruction']["CC"]): has_CC=True
 
             try:
-
-                if 0.4 <= instruction_prob < 0.6 and has_QA_or_cap: # 分支A，随机抽取一个纯视觉问题（比如“桌子上有什么？”），让 Assistant 先回答这个问题，然后再输出动作 Token。这迫使模型学习观察环境。
-                # 假设原始数据 anno 长这样：
-                # anno = {
-                #     'alt_instruction': {
-                #         'Caption': "桌子上有一个红色的苹果。",
-                #         'QA': [
-                #             {'question': "杯子是什么颜色的？", 'answer': "蓝色"},
-                #             {'question': "有几个盘子？", 'answer': "2个"}
-                #         ]
-                #     }
-                # }
-                # 执行代码过程：
-                # 生成临时问题：从 caption_prompts 随机抽一个（比如 "Describe the table"）。
-                # 构建第一个列表： [{'question': "Describe the table", 'answer': "桌子上有一个红色的苹果。"}]
-                # 获取第二个列表： [{'question': "杯子是什么颜色？", ...}, {'question': "有几个盘子？", ...}]
-                # 执行 + 拼接：
-                # 最终产生的 all_optional_QA：
-                # Python
-                # [
-                # {'question': "Describe the table", 'answer': "桌子上有一个红色的苹果。"}, # 这是新加的
-                # {'question': "杯子是什么颜色的？", 'answer': "蓝色"},                    # 这是原来的
-                # {'question': "有几个盘子？", 'answer': "2个"}                          # 这是原来的
-                # ]
-
+                if 0.4 <= instruction_prob < 0.6 and has_QA_or_cap:
                     all_optional_QA = [ 
                         dict(
-                            question = random.sample(self.caption_prompts, 1)[0],#random.sample(self.caption_prompts, 1)：物理结果：即便只抽一个，它返回的也是一个列表，例如 ["Describe the table"]。末尾的 [0]：物理结果：从列表中把那个字符串提取出来。原因：如果不加 [0]，字典里的 question 就会变成一个列表，导致后续 Tokenizer 报错
+                            question = random.sample(self.caption_prompts, 1)[0],
                             answer = anno['alt_instruction']['Caption']
                         )
                     ] + anno['alt_instruction']['QA']
@@ -1294,28 +837,6 @@ class RLDSBatchTransform:
                 ]
         else:
             raise NotImplementedError(f'which stage ???')
-
-
-
-
-        # 这行代码调用了底层的 EagleProcessor。它在内存中执行了剧烈的物理变换：
-        # 字符串粉碎：把刚刚构建的 prompt 按照 Qwen2 的字典表，翻译成离散的整数数组。
-        # 标签生成（极度关键）：它生成了 labels 数组。它精确地找到了数组中“人类提问”的部分，并将它们全部强行覆写为 -100（即 IGNORE_INDEX），只保留了“机器人应该回答的文本和动作”的真实 ID。
-        # 图像量化：把字典里挂载的 last_image（RGB 数组）按照模型要求裁剪、缩放、并归一化
-
-
-
-        #  一、 内存张量对比映射（它到底去掉了哪些？）
-        # 当 preprocess_inputs_and_labels 接收到你的字典后，它首先会在底层将字典按 Qwen2 的规范展平为一句完整的字符串（包含控制符）： <|im_start|>system\nDEFAULT...<|im_end|>\n<|im_start|>user\nWhat action...<|im_end|>\n<|im_start|>assistant\n蓝色 <new_token_0>...
-        # 然后，处理器将其转化为两个长度绝对相等的整数一维张量。我们假设这句话总共被切成了 20 个 Token：
-        # 矩阵 1：input_ids（模型的“眼睛”看的输入） 物理状态：全部保留真实 ID。 数据形态：[901, 882, ..., 334, 15, ..., 778, 151643, 151644...]
-            # 包含 System 的文字：保留。
-            # 包含 User 的文字与图片占位符：保留。
-            # 包含 Assistant 的文字与动作：保留。
-        # 矩阵 2：labels（损失函数的“红笔”对的答案） 物理状态：前半部分被强制修改为 -100，仅保留最后一部分。 数据形态：[-100, -100, ..., -100, -100, ..., 778, 151643, 151644...]
-            # System DEFAULT_SYSTEM_MESSAGE：覆写为 -100。
-            # User What action should the robot take... 与图像：覆写为 -100。
-            # Assistant curr_QA["answer"] + <new_token_x>：唯一保留真实 ID。
 
         inputs = self.processor.preprocess_inputs_and_labels({"prompt": prompt})
 
@@ -1523,13 +1044,6 @@ def load(
 
     tokenizer = AutoTokenizer.from_pretrained(llm_backbone_id, use_fast=True)
 
-
-        # “Eagle” 只是研究团队为这套包含图像处理、投影映射和多模态指令微调的上层综合系统取的名字。团队并没有耗费数千万美元的算力去从零训练一个语言矩阵。
-        # Eagle 系统内部的那个“语言主干（LLM Backbone）”，其底层的基础网络拓扑结构和预训练语言权重，直接采用了开源的 Qwen2（千问2）模型（通常是 Qwen2-1.5B 或 2B 版本）。
-        # 工程强制约束条件：
-        # 由于核心计算矩阵是 Qwen2，这意味着该矩阵在经历数万亿 Token 的初始预训练时，其底层注意力机制（Self-Attention）已经被强制烙印了极度严格的位置编码与控制字符识别规律。
-        #     物理冲突：如果你向该矩阵输入 LLaMA 的模板字符（如 [INST]），或者直接输入没有包裹控制符的纯文本，Qwen2 的注意力矩阵在执行乘法运算时，无法识别句子的边界和对话的角色（人类还是系统），最终输出的概率分布（Logits）将直接崩溃，产生乱码。
-        #     指令对齐：因此，template = "qwen2-chat" 是一条绝对强制的底层数据清洗指令。它要求处理器在将用户输入的字符串转化为数字张量进入 Eagle 系统之前，必须严格按照 Qwen2 矩阵能看懂的特定 ASCII 字符结构（即插入 <|im_start|>user\n 等标记）进行物理拼接，从而保证底层 Qwen2 算子能够正常输出连续的浮点数特征。
     processor = EagleProcessor(
         llm_backbone_id,
         max_input_tiles=1,
@@ -1539,14 +1053,11 @@ def load(
         ),
     )
 
-
     vlm = AutoModel.from_pretrained(
         llm_backbone_id,
-        # attn_implementation="flash_attention_2",
-        attn_implementation="eager",
+        attn_implementation="flash_attention_2",
         trust_remote_code=True
         )
-
 
     new_tokens = ['<new_token_{}>'.format(i) for i in range(num_of_meta_query)]  # Create 256 new token names
     overwatch.info(f"add {len(new_tokens)} latent action tokens")
@@ -1665,6 +1176,3 @@ def load_vla(
     )
 
     return vla
-
-
-
